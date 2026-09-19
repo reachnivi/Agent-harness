@@ -72,3 +72,41 @@ uv run pytest -v
 | `count_tokens` endpoint | Stage 7: token counts are approximations. |
 | Prompt caching | Irrelevant at this scale. |
 | Server-side tools (`web_search`) | Stage 7: needs a real Anthropic key. |
+
+---
+
+# Second harness: `dshpy/` — the plugin pattern, no SDK
+
+A Python port of the architecture behind [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness)
+(MIT, TypeScript), whose thesis is *everything is a plugin* — the model adapter, the tool
+registry, the session log, **and the agent loop itself**. Uses **no LLM SDK at all**: stdlib
+`urllib` and two hand-written wire adapters.
+
+```bash
+ollama serve
+uv run -m dshpy.cli --dump-config                       # see the mounted plugin tree
+uv run -m dshpy.cli "what is 17 * 23, and what time is it?"
+uv run -m dshpy.cli --provider anthropic "same question" # different wire protocol, same everything else
+```
+
+`--provider` swaps `/v1/chat/completions` (DeepSeek/OpenAI `tool_calls`) for `/v1/messages`
+(Anthropic content blocks). The loop, the tools and the permission policy are untouched — that
+swap working is the whole claim, and `tests/test_adapters.py` asserts it.
+
+Config is `DS_*` in `.env`: `DS_PROVIDER`, `DS_MODEL`, `DS_BASE_URL`, `DS_API_KEY`.
+
+**Read [`docs/PLUGINS.md`](docs/PLUGINS.md)** for the pattern, the gate-vs-guard distinction,
+and an honest list of what was left out.
+
+### The two harnesses compared
+
+| | `stages/` + `harness/` | `dshpy/` |
+|---|---|---|
+| Add a tool | edit `TOOLS` **and** `dispatch()` | one registration in a plugin |
+| Add policy | edit the loop | listen on `tools/pre-execute` |
+| Change provider | rewrite the loop | change one profile row |
+| SDK | `anthropic` | none |
+| Lines before you understand it | ~200 | ~700 |
+
+The last row is the real cost: three times the code, buying nothing until the second provider,
+the second policy, or the second person shows up. Knowing which situation you're in is the skill.
