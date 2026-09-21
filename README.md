@@ -93,6 +93,19 @@ uv run -m dshpy.cli --provider anthropic "same question" # different wire protoc
 (Anthropic content blocks). The loop, the tools and the permission policy are untouched — that
 swap working is the whole claim, and `tests/test_adapters.py` asserts it.
 
+```bash
+uv run -m dshpy.cli --profile coding "fix the failing test"   # fs + shell + subagents
+uv run -m dshpy.cli --sessions                                # list stored sessions
+uv run -m dshpy.cli --resume <id> "and now add a docstring"   # continue where you left off
+uv run -m dshpy.cli --fork <id> "try a different approach"    # branch at the last turn
+```
+
+**What it does now:** streaming with hand-written SSE parsers for both dialects, cooperative
+cancellation, retry with backoff, token metering, a filesystem and shell behind swappable
+seams, read-before-edit and path confinement, JSONL persistence with resume and fork,
+compaction that shortens the model's view without touching the record, and subagents with
+per-agent tool scoping. ~5,000 lines, 237 tests, still no LLM SDK.
+
 Config is `DS_*` in `.env`: `DS_PROVIDER`, `DS_MODEL`, `DS_BASE_URL`, `DS_API_KEY`.
 
 **Read [`docs/PLUGINS.md`](docs/PLUGINS.md)** for the pattern, the gate-vs-guard distinction,

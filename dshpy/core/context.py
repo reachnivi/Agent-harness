@@ -56,10 +56,14 @@ class Context:
     unmounting the plugin unwinds exactly its own work and nothing else.
     """
 
-    def __init__(self, runtime: "Runtime", scope: EffectScope) -> None:
+    def __init__(self, runtime: "Runtime", scope: EffectScope,
+                 scope_key: Any = None) -> None:
         # Leading underscores keep the namespace clear for service keys: `ctx.tools`, `ctx.llm`.
         self._runtime = runtime
         self._scope = scope
+        # The opaque scope key (phase 9). None means global. Services that support scoping
+        # read `ctx.scope_key` and bind their registrations to it.
+        self._scope_key = scope_key
 
     # --- services -------------------------------------------------------------------------
 
@@ -131,6 +135,21 @@ class Context:
     @property
     def name(self) -> str:
         return self._scope.name
+
+    @property
+    def scope_key(self) -> Any:
+        """The opaque scope this context registers into, or None for global."""
+        return self._scope_key
+
+    def fork(self, scope_key: Any) -> "Context":
+        """A view onto the same runtime whose registrations are bound to `scope_key`.
+
+        Same services, same event bus, same effect scope — only the visibility of *new*
+        registrations changes. That is deliberately narrow: a fork is not a sandbox and does
+        not isolate state. It scopes what a registration is visible to, nothing more, and
+        pretending otherwise would be the dangerous kind of abstraction.
+        """
+        return Context(self._runtime, self._scope, scope_key)
 
 
 class Runtime:

@@ -11,6 +11,11 @@ Note it prints tool calls by NAME as soon as the name is known, before any argum
 finished streaming. The Anthropic dialect gives the name on block-start, so "calling
 calculate..." can appear while its arguments are still arriving -- a small thing that makes an
 agent feel responsive instead of stuck.
+
+It also filters on scope. A subagent shares this event bus, so without that check the UI
+renders the child's reply AND the parent's, and the user sees two answers to one question with
+no way to tell which is authoritative. Sharing a bus across agents makes scope part of the
+event's contract, not an optional extra.
 """
 
 from __future__ import annotations
@@ -27,7 +32,12 @@ def apply(ctx, config=None) -> None:
     out = (config or {}).get("stream", sys.stdout)
     state = {"open": False, "named": set()}
 
-    def on_chunk(chunk) -> None:
+    def on_chunk(chunk, scope=None) -> None:
+        # Only the root agent renders. A subagent's stream belongs to its parent's tool
+        # result, not to the user's transcript -- showing it produces two answers to one
+        # question, and the user cannot tell which is the real one.
+        if scope is not None:
+            return
         if isinstance(chunk, TextDelta):
             if not state["open"]:
                 out.write("\nbot> ")

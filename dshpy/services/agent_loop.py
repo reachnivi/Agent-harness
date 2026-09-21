@@ -39,10 +39,18 @@ class AgentLoopService:
         self.max_steps: int = config.get("max_steps", DEFAULT_MAX_STEPS)
         self.max_tokens: int | None = config.get("max_tokens")
         self.system: str | None = config.get("system")
+        # Set by the subagent provider: a child runs the same loop against its own
+        # session log and a restricted tool scope. The loop itself needs no branching.
+        self._sessions_override = None
+        self._scope = None
+        self._depth = 0
+        self._parents: tuple = ()
 
     def run(self, user_input: str, token: CancelToken | None = None) -> str:
         ctx = self._ctx
-        sessions, tools, llm = ctx.sessions, ctx.tools, ctx.llm
+        sessions = self._sessions_override or ctx.sessions
+        tools, llm = ctx.tools, ctx.llm
+        scope = self._scope
         # One token for the whole turn: cancelling it stops the model request AND every
         # tool still running under it. Per-tool deadlines hang off this as children.
         token = token or NEVER
@@ -64,14 +72,17 @@ class AgentLoopService:
             # ended -- the whole point of streaming is that those two needs differ.
             options = GenerateOptions(
                 messages=sessions.derive_messages(),
-                tools=tools.schemas(),
+                tools=tools.schemas(scope),
                 model=self.model,
                 max_tokens=self.max_tokens,
                 token=token,
             )
             assembler = BlockAssembler()
             for chunk in llm.stream(options, self.provider):
-                ctx.emit("agent/stream", chunk)
+                # Carry the scope: a child agent shares this event bus, so a listener has
+                # no other way to tell the root agent's stream from a subagent's. Without
+                # it the UI renders both and the user sees two answers to one question.
+                ctx.emit("agent/stream", chunk, scope)
                 assembler.push(chunk)
             completion = assembler.result()
 
@@ -90,7 +101,9 @@ class AgentLoopService:
                                 name=call.name, arguments=call.arguments)
                 # Everything interesting -- policy, guards, timeouts, result rewriting --
                 # happens inside this one call, contributed by plugins the loop never names.
-                result = tools.execute(call.id, call.name, call.arguments, token=token)
+                result = tools.execute(call.id, call.name, call.arguments,
+                                       token=token, scope=scope,
+                                       depth=self._depth, parents=self._parents)
                 sessions.append("tool/result", call_id=result.call_id, name=result.name,
                                 content=result.content, is_error=result.is_error)
 

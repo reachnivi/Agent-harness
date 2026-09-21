@@ -86,6 +86,7 @@ pins this down.
 | `ctx.shell` | `services/shell.py` | subprocess seam; `shell_local` is the provider |
 | `ctx.persistence` | `services/persistence.py` | storing/reloading a log; JSONL backend |
 | `ctx.compaction` | `services/compaction.py` | replacing a span of history with a summary |
+| `ctx.subagents` | `services/subagents.py` | named registry of delegation providers |
 
 dsh has many more (`ctx.agents`, `ctx.jobs`, `ctx.fs`, `ctx.sandbox`, `ctx.commands`,
 `ctx.approval`, …). The four here are enough to show the shape.
@@ -192,6 +193,49 @@ safe — but `Path("../../escape").name` is `"escape"`, so a suspicious id was s
 and the caller read a different session than it asked for, with nothing reporting it. It now
 refuses. Silent correction of suspicious input turns an attack into an unreproducible bug report.
 
+## Scoped registration and subagents (phase 9)
+
+`core/scope.py` is the kernel upgrade this document previously listed as omitted.
+
+**A `ScopeKey` is an opaque object identity** — dsh uses the live Agent object and never
+inspects it, and copying that exactly buys three things: no naming scheme to collide, no
+opinion about what a scope *is* (so the same machinery scopes a session or a request later),
+and lifetime by ownership rather than bookkeeping.
+
+The visibility rule, in full:
+
+> a registration with scope S is visible to S and nothing else;
+> a registration with no scope is visible to everyone.
+
+**Visibility is additive, so subtraction needs its own mechanism.** A subagent must not lose
+the tools everyone already had merely by existing — so `ctx.tools.restrict(scope, allowed)` is
+a separate filter. The first design re-registered a filtered *copy* of every tool into the
+child's scope, which collided with the originals (global tools are visible inside every scope),
+doubled the registry, and had to be undone item by item. One filter entry is exact and reverses
+in one call.
+
+**`ctx.subagents` is a named registry, not a single-provider seam** — unlike `ctx.fs` and
+`ctx.shell`. dsh makes the same split, and the deciding question is simply whether the caller
+needs to choose. "Read this file" has no selector; "delegate to *which* kind of agent" does.
+
+**Capabilities are checked before the run and fail loud.** A provider that silently ignores a
+requested depth limit is the worst case: nothing looks wrong until a recursive delegation burns
+the budget, and the option you asked for was the one that would have told you.
+
+**A depth limit is not a cycle guard.** Three agents delegating in a ring each stay at depth 1
+while looping forever, so requests also carry their ancestry.
+
+### Two things this surfaced
+
+- **Inferring a scope from the calling context cannot work.** One `ToolsService` serves every
+  context, so it holds the ctx it was *created* with and would scope every registration to that
+  one regardless of the caller. `register(tool, scope=...)` is explicit instead. Magic that
+  silently reads the wrong value is worse than an argument.
+- **A shared event bus makes scope part of an event's contract.** A subagent emits
+  `agent/stream` on the same bus, so `stream_ui` rendered the child's reply *and* the parent's
+  — two answers to one question with no way to tell which was authoritative. The event now
+  carries its scope.
+
 ## What was deliberately left out
 
 Faithfulness has a cost, and these were judged not worth it for a learning port:
@@ -200,7 +244,6 @@ Faithfulness has a cost, and these were judged not worth it for a learning port:
 - **Bundles, profiles-as-packages, `cordis.patch.yml` layering, HMR** — real dsh composes a
   plugin tree from ordered layers, each patchable by the ones above. That is config plumbing,
   not architectural insight. `profiles/default.py` is the one-layer version.
-- **Context forking / isolate realms** — dsh scopes registrations per agent via `agent.ctx`.
 - **Async.** dsh's adapters are `AsyncIterable` because Node is async; ours are sync generators.
   Identical streaming semantics, and it keeps `async def` out of the kernel and every plugin.
   The one real cost: tool calls in a batch run sequentially, where dsh runs them concurrently.
