@@ -22,7 +22,8 @@ WHAT IS AND ISN'T HERE
 
 from __future__ import annotations
 
-from dshpy.services.llm import Message
+from dshpy.cancel import NEVER, CancelToken
+from dshpy.services.llm import BlockAssembler, GenerateOptions, Message
 
 name = "agent-loop"
 inject = ["llm", "tools", "sessions"]
@@ -39,9 +40,12 @@ class AgentLoopService:
         self.max_tokens: int | None = config.get("max_tokens")
         self.system: str | None = config.get("system")
 
-    def run(self, user_input: str) -> str:
+    def run(self, user_input: str, token: CancelToken | None = None) -> str:
         ctx = self._ctx
         sessions, tools, llm = ctx.sessions, ctx.tools, ctx.llm
+        # One token for the whole turn: cancelling it stops the model request AND every
+        # tool still running under it. Per-tool deadlines hang off this as children.
+        token = token or NEVER
 
         if self.system and not any(e.kind == "system/message" for e in sessions.events()):
             sessions.append("system/message", content=self.system)
@@ -53,13 +57,23 @@ class AgentLoopService:
         for step in range(self.max_steps):  # rule 4: bounded
             ctx.emit("step/start", step)
 
-            completion = llm.generate(
-                sessions.derive_messages(),
+            # Stream, and fold as we go. Two consumers of one stream: this assembler
+            # (which needs a finished message to continue the loop) and whatever listens to
+            # `agent/stream` (which wants deltas as they arrive). Calling llm.generate() here
+            # would work identically but would give a UI nothing to render until the turn
+            # ended -- the whole point of streaming is that those two needs differ.
+            options = GenerateOptions(
+                messages=sessions.derive_messages(),
                 tools=tools.schemas(),
                 model=self.model,
-                provider=self.provider,
                 max_tokens=self.max_tokens,
+                token=token,
             )
+            assembler = BlockAssembler()
+            for chunk in llm.stream(options, self.provider):
+                ctx.emit("agent/stream", chunk)
+                assembler.push(chunk)
+            completion = assembler.result()
 
             sessions.append(
                 "assistant/message",
@@ -76,7 +90,7 @@ class AgentLoopService:
                                 name=call.name, arguments=call.arguments)
                 # Everything interesting -- policy, guards, timeouts, result rewriting --
                 # happens inside this one call, contributed by plugins the loop never names.
-                result = tools.execute(call.id, call.name, call.arguments)
+                result = tools.execute(call.id, call.name, call.arguments, token=token)
                 sessions.append("tool/result", call_id=result.call_id, name=result.name,
                                 content=result.content, is_error=result.is_error)
 

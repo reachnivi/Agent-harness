@@ -184,21 +184,54 @@ def test_the_guard_survives_an_allow_everything_policy(path_tool_rt):
 # --- timeout and telemetry --------------------------------------------------------------------
 
 
-def test_timeout_returns_an_error_result_rather_than_hanging():
+def test_timeout_interrupts_a_tool_that_polls_its_token():
+    """Cancellation is COOPERATIVE: the tool must look at the token for this to work."""
     import time
     from dshpy.services.tools import define_tool
+
+    def polls(args, exec):
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            exec.token.check()   # <- the whole contract, in one line
+            time.sleep(0.005)
+        return "finished"
 
     rt = Runtime()
     rt.mount_all(base_rows())
     rt.mount(timeout, {"seconds": 0.05})
     rt.services["tools"].register(define_tool(
-        name="slow", description="slow", parameters={},
-        execute=lambda args, exec: time.sleep(5),
-    ))
+        name="slow", description="slow", parameters={}, execute=polls))
 
+    started = time.monotonic()
     result = rt.services["tools"].execute("c1", "slow", {})
-    assert result.is_error and "timed out" in result.content
+    elapsed = time.monotonic() - started
+
+    assert result.is_error
     assert result.meta["timed_out"] is True
+    assert elapsed < 1.0, "the call should have returned at the deadline, not run to completion"
+
+
+def test_a_tool_that_ignores_its_token_is_NOT_interrupted():
+    """The honest limitation, asserted rather than hidden.
+
+    Python cannot safely interrupt an arbitrary thread, so a tool body that never polls runs
+    to completion no matter what the deadline says. Phase 5's daemon-thread version *appeared*
+    to handle this by returning early while the work carried on invisibly -- which is worse,
+    because the caller believes the work stopped. Failing visibly beats succeeding falsely.
+    """
+    import time
+    from dshpy.services.tools import define_tool
+
+    rt = Runtime()
+    rt.mount_all(base_rows())
+    rt.mount(timeout, {"seconds": 0.01})
+    rt.services["tools"].register(define_tool(
+        name="stubborn", description="never polls", parameters={},
+        execute=lambda args, exec: (time.sleep(0.1), "done anyway")[1]))
+
+    result = rt.services["tools"].execute("c1", "stubborn", {})
+    assert result.content == "done anyway"
+    assert not result.is_error
 
 
 def test_timeout_does_not_interfere_with_a_fast_tool():

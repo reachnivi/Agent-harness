@@ -18,6 +18,9 @@ from __future__ import annotations
 import json
 import urllib.error
 import urllib.request
+from typing import Iterator
+
+from dshpy.cancel import NEVER, CancelToken
 
 
 class HttpError(RuntimeError):
@@ -36,18 +39,57 @@ class HttpError(RuntimeError):
         self.url = url
 
 
-def post_json(url: str, payload: dict, *, api_key: str | None = None,
-              headers: dict[str, str] | None = None, timeout: float = 120.0) -> dict:
-    """POST a JSON body, return the parsed JSON response."""
-    body = json.dumps(payload).encode()
+def _build_request(url: str, payload: dict, api_key: str | None,
+                   headers: dict[str, str] | None) -> urllib.request.Request:
     request_headers = {"Content-Type": "application/json"}
     if api_key:
         request_headers["Authorization"] = f"Bearer {api_key}"
     request_headers.update(headers or {})
+    return urllib.request.Request(
+        url, data=json.dumps(payload).encode(), headers=request_headers, method="POST"
+    )
 
-    req = urllib.request.Request(url, data=body, headers=request_headers, method="POST")
+
+def post_json(url: str, payload: dict, *, api_key: str | None = None,
+              headers: dict[str, str] | None = None, timeout: float = 120.0) -> dict:
+    """POST a JSON body, return the parsed JSON response."""
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
+        with urllib.request.urlopen(
+            _build_request(url, payload, api_key, headers), timeout=timeout
+        ) as resp:
             return json.loads(resp.read())
     except urllib.error.HTTPError as exc:
         raise HttpError(exc.code, exc.read().decode(errors="replace"), url) from None
+
+
+def post_stream(url: str, payload: dict, *, api_key: str | None = None,
+                headers: dict[str, str] | None = None, timeout: float = 120.0,
+                token: CancelToken | None = None,
+                chunk_size: int = 1024) -> Iterator[bytes]:
+    """POST and yield the response body in chunks, as it arrives.
+
+    Streaming over `urllib` is just *not calling `.read()` with no argument*. `read(n)` returns
+    as soon as n bytes are available rather than waiting for the whole body, and that is the
+    entire mechanism — there is nothing else to streaming at the transport layer.
+
+    The cancellation check sits at the top of the read loop, which is the cheapest correct
+    place: it runs between socket reads, so a cancelled request stops at the next chunk
+    boundary rather than after the model has finished generating. A token you never poll is a
+    token that does nothing, and this loop is the main thing worth polling in the whole system.
+    """
+    token = token or NEVER
+    try:
+        resp = urllib.request.urlopen(
+            _build_request(url, payload, api_key, headers), timeout=timeout
+        )
+    except urllib.error.HTTPError as exc:
+        # Read the body before raising: for every LLM API it holds the actual reason.
+        raise HttpError(exc.code, exc.read().decode(errors="replace"), url) from None
+
+    with resp:
+        while True:
+            token.check()
+            chunk = resp.read(chunk_size)
+            if not chunk:
+                return
+            yield chunk

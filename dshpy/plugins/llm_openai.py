@@ -1,66 +1,87 @@
-"""OpenAI / DeepSeek wire format, over raw HTTP.
+"""OpenAI / DeepSeek wire format, over raw HTTP. Streaming and non-streaming.
 
-Works against DeepSeek's API (`https://api.deepseek.com/v1`) and any OpenAI-compatible server,
+Works against DeepSeek (`https://api.deepseek.com/v1`) and any OpenAI-compatible server,
 including Ollama at `http://localhost:11434/v1`.
 
 THE WIRE FORMAT, AND WHERE IT BITES
 
-    Request:   {"model", "messages", "tools": [{"type":"function","function":{...}}]}
-    Response:  choices[0].message.tool_calls = [
-                   {"id", "type":"function", "function":{"name","arguments"}}
-               ]
+    Request:   {"model", "messages", "tools":[{"type":"function","function":{...}}], "stream"}
+    Response:  choices[0].message.tool_calls = [{"id","type","function":{"name","arguments"}}]
                choices[0].finish_reason == "tool_calls"
     Results:   ONE {"role":"tool","tool_call_id","content"} message PER CALL.
 
-    Three things about this protocol that the neutral vocabulary in services/llm.py exists to
-    hide from everything above:
+    Three things the neutral vocabulary exists to hide from everything above:
 
-    1. `function.arguments` is a **JSON string**, not an object. The model generates it token by
-       token, so it can be truncated or malformed — a normal occurrence, not an exception. The
-       Anthropic format hands you a parsed dict and never exposes you to this.
+    1. `function.arguments` is a **JSON string**, not an object — generated token by token, so
+       it can be truncated or malformed. The Anthropic format hands you a parsed dict and never
+       exposes you to this.
+    2. Tool results are **one message each**. The Anthropic format wants the exact opposite:
+       one user message carrying every result as a block. Getting this backwards doesn't always
+       error — it can just quietly degrade parallel tool calling.
+    3. `content` is `null` when there are tool calls, so a naive read gives `None`.
 
-    2. Tool results are **one message each**, in order. The Anthropic format wants the exact
-       opposite: one user message carrying every result as a block. Getting this backwards
-       doesn't always error — it can just quietly degrade parallel tool calling.
+THE SSE DIALECT
 
-    3. `content` is `null` when there are tool calls, so a naive `message["content"]` gives you
-       `None` where you expected a string.
+    Anonymous frames — no `event:` line, just `data:` — terminated by a literal `data: [DONE]`.
+    Each frame holds `choices[0].delta`, a *partial* message:
 
-    All three are handled here and nowhere else. That containment is the point of the seam.
+        {"choices":[{"delta":{"content":"He"}}]}
+        {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1",
+                              "function":{"name":"calculate","arguments":"{\\"exp"}}]}}]}
+        {"choices":[{"delta":{"tool_calls":[{"index":0,
+                              "function":{"arguments":"ression\\":\\"2+2\\"}"}}]}}]}
+
+    Note `tool_calls[].index`: that is the provider telling you which call a fragment belongs
+    to, and it is why the neutral protocol carries an index too. `id` and `name` usually arrive
+    only on the first fragment of a call; `arguments` arrives in pieces that must be
+    concatenated in order and parsed only once complete.
 """
 
 from __future__ import annotations
 
 import json
+from typing import Iterator
 
-from dshpy.services.llm import Completion, LlmAdapter, Message, ToolCall
-from dshpy.transport import post_json
+from dshpy.services.llm import (
+    BlockEnd,
+    BlockStart,
+    Finish,
+    GenerateOptions,
+    LlmAdapter,
+    Message,
+    StreamChunk,
+    TextDelta,
+    ToolCallDelta,
+    Usage,
+    UsageChunk,
+)
+from dshpy.sse import parse_sse
+from dshpy.transport import post_json, post_stream
 
 name = "llm-openai"
 inject = ["llm"]
+
+_FINISH_REASONS = {"stop": "stop", "tool_calls": "tool_calls", "length": "length"}
 
 
 class OpenAIAdapter(LlmAdapter):
     provider = "openai"
 
-    def __init__(self, base_url: str, api_key: str, timeout: float = 120.0) -> None:
+    def __init__(self, base_url: str, api_key: str, timeout: float = 120.0,
+                 retry_policy: dict | None = None) -> None:
         self.base_url = base_url.rstrip("/")
         self.api_key = api_key
         self.timeout = timeout
+        self.retry_policy = retry_policy
 
     # --- outbound: neutral -> wire ---------------------------------------------------------
 
     @staticmethod
     def _encode_tools(tools: list[dict]) -> list[dict]:
         return [
-            {
-                "type": "function",
-                "function": {
-                    "name": t["name"],
-                    "description": t["description"],
-                    "parameters": t["parameters"],
-                },
-            }
+            {"type": "function",
+             "function": {"name": t["name"], "description": t["description"],
+                          "parameters": t["parameters"]}}
             for t in tools
         ]
 
@@ -70,25 +91,17 @@ class OpenAIAdapter(LlmAdapter):
         for msg in messages:
             if msg.role == "tool":
                 # Rule 1, this protocol's version: one message per result.
-                out.append({
-                    "role": "tool",
-                    "tool_call_id": msg.tool_call_id,
-                    "content": msg.content,
-                })
+                out.append({"role": "tool", "tool_call_id": msg.tool_call_id,
+                            "content": msg.content})
             elif msg.role == "assistant" and msg.tool_calls:
                 out.append({
                     "role": "assistant",
                     "content": msg.content or None,  # null, not "", when there are calls
                     "tool_calls": [
-                        {
-                            "id": tc.id,
-                            "type": "function",
-                            "function": {
-                                "name": tc.name,
-                                # Back to a STRING on the way out, since that is what we parsed.
-                                "arguments": json.dumps(tc.arguments),
-                            },
-                        }
+                        {"id": tc.id, "type": "function",
+                         "function": {"name": tc.name,
+                                      # back to a STRING on the way out
+                                      "arguments": json.dumps(tc.arguments)}}
                         for tc in msg.tool_calls
                     ],
                 })
@@ -96,69 +109,105 @@ class OpenAIAdapter(LlmAdapter):
                 out.append({"role": msg.role, "content": msg.content})
         return out
 
-    # --- inbound: wire -> neutral ----------------------------------------------------------
-
-    @staticmethod
-    def _decode(payload: dict) -> Completion:
-        choice = (payload.get("choices") or [{}])[0]
-        message = choice.get("message") or {}
-
-        calls = []
-        for raw in message.get("tool_calls") or []:
-            fn = raw.get("function") or {}
-            calls.append(ToolCall(
-                id=raw.get("id", ""),
-                name=fn.get("name", ""),
-                arguments=_parse_arguments(fn.get("arguments")),
-            ))
-
-        return Completion(
-            text=message.get("content") or "",  # `or ""` handles the null-content case
-            tool_calls=calls,
-            finish_reason=choice.get("finish_reason") or "stop",
-            raw=payload,
-        )
-
-    # --- the call --------------------------------------------------------------------------
-
-    def generate(self, messages: list[Message], *, tools: list[dict],
-                 model: str, max_tokens: int | None = None) -> Completion:
+    def _payload(self, options: GenerateOptions, stream: bool) -> dict:
         payload: dict = {
-            "model": model,
-            "messages": self._encode_messages(messages),
+            "model": options.model,
+            "messages": self._encode_messages(options.messages),
         }
-        if tools:
-            payload["tools"] = self._encode_tools(tools)
-        if max_tokens is not None:
-            payload["max_tokens"] = max_tokens  # optional here; required in the Anthropic API
+        if options.tools:
+            payload["tools"] = self._encode_tools(options.tools)
+        if options.max_tokens is not None:
+            payload["max_tokens"] = options.max_tokens  # optional here; required by Anthropic
+        if stream:
+            payload["stream"] = True
+            # Without this, most OpenAI-compatible servers send no usage at all when streaming.
+            payload["stream_options"] = {"include_usage": True}
+        return payload
 
-        return self._decode(post_json(
+    # --- streaming ---------------------------------------------------------------------------
+
+    def stream(self, options: GenerateOptions) -> Iterator[StreamChunk]:
+        byte_chunks = post_stream(
             f"{self.base_url}/chat/completions",
-            payload,
+            self._payload(options, stream=True),
             api_key=self.api_key,
             timeout=self.timeout,
-        ))
+            token=options.token,
+        )
 
+        text_index: int | None = None
+        open_calls: dict[int, bool] = {}   # provider index -> has block-start been emitted
+        next_index = 0                      # OUR index, allocated in first-seen order
+        call_index: dict[int, int] = {}     # provider tool_call index -> our block index
+        usage = Usage()
+        finish_reason = "stop"
 
-def _parse_arguments(raw: str | dict | None) -> dict:
-    """Turn `function.arguments` into a dict, defensively.
+        for event in parse_sse(byte_chunks):
+            try:
+                frame = json.loads(event.data)
+            except json.JSONDecodeError:
+                continue  # a keep-alive or a malformed frame: skip rather than abort the turn
 
-    The model writes this string token by token, so truncation and malformed JSON are ordinary
-    outcomes. Raising here would kill the loop; instead we return a marker the tool will reject,
-    which becomes an error result the model can read and retry from. Same reasoning as rule 3.
+            # A usage-only frame has an empty choices list, hence the `or [{}]`.
+            for choice in frame.get("choices") or []:
+                delta = choice.get("delta") or {}
 
-    Some OpenAI-compatible servers (Ollama among them, for some models) helpfully hand back an
-    already-parsed object, so accept that too rather than assuming the spec is followed.
-    """
-    if raw is None:
-        return {}
-    if isinstance(raw, dict):
-        return raw
-    try:
-        parsed = json.loads(raw)
-    except (json.JSONDecodeError, TypeError):
-        return {"__malformed__": raw}
-    return parsed if isinstance(parsed, dict) else {"__malformed__": raw}
+                if delta.get("content"):
+                    if text_index is None:
+                        text_index = next_index
+                        next_index += 1
+                        yield BlockStart(index=text_index, block_type="text")
+                    yield TextDelta(index=text_index, text=delta["content"])
+
+                for raw_call in delta.get("tool_calls") or []:
+                    provider_index = raw_call.get("index", 0)
+                    if provider_index not in call_index:
+                        call_index[provider_index] = next_index
+                        next_index += 1
+                    index = call_index[provider_index]
+
+                    fn = raw_call.get("function") or {}
+                    if not open_calls.get(provider_index):
+                        open_calls[provider_index] = True
+                        yield BlockStart(index=index, block_type="tool-call")
+
+                    yield ToolCallDelta(
+                        index=index,
+                        id=raw_call.get("id") or "",
+                        name=fn.get("name"),
+                        # Rule 2: a raw fragment. Never parsed here.
+                        arguments_delta=fn.get("arguments") or "",
+                    )
+
+                if choice.get("finish_reason"):
+                    finish_reason = _FINISH_REASONS.get(choice["finish_reason"], "stop")
+
+            if frame.get("usage"):
+                usage = Usage(
+                    input_tokens=frame["usage"].get("prompt_tokens", 0),
+                    output_tokens=frame["usage"].get("completion_tokens", 0),
+                )
+
+        for index in sorted({*([text_index] if text_index is not None else []),
+                             *call_index.values()}):
+            yield BlockEnd(index=index)
+
+        # Rule 3: usage BEFORE finish, nothing after finish.
+        yield UsageChunk(usage=usage)
+        yield Finish(reason=finish_reason)
+
+    # --- non-streaming -----------------------------------------------------------------------
+    #
+    # Kept rather than inherited from LlmAdapter.generate() because some deployments disable
+    # streaming, and because the swap test is clearer when both paths exist and agree.
+
+    def generate_once(self, options: GenerateOptions):
+        return post_json(
+            f"{self.base_url}/chat/completions",
+            self._payload(options, stream=False),
+            api_key=self.api_key,
+            timeout=self.timeout,
+        )
 
 
 def apply(ctx, config=None) -> None:
@@ -167,5 +216,6 @@ def apply(ctx, config=None) -> None:
         base_url=config.get("base_url", "http://localhost:11434/v1"),
         api_key=config.get("api_key", "ollama"),
         timeout=config.get("timeout", 120.0),
+        retry_policy=config.get("retry_policy"),
     )
     ctx.effect(ctx.llm.register_adapter(config.get("routes", ["openai"]), adapter))

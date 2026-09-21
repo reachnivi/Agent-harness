@@ -22,7 +22,17 @@ import os
 
 from dotenv import load_dotenv
 
-from dshpy.plugins import llm_anthropic, llm_openai, permission, telemetry, timeout, tool_core
+from dshpy.plugins import (
+    llm_anthropic,
+    llm_openai,
+    llm_retry,
+    permission,
+    stream_ui,
+    telemetry,
+    timeout,
+    token_meter,
+    tool_core,
+)
 from dshpy.services import agent_loop, llm, sessions, tools
 
 load_dotenv()
@@ -77,10 +87,15 @@ def rows() -> list[dict]:
         # --- capabilities -----------------------------------------------------------------
         {"plugin": tool_core},
 
+        # --- resilience and accounting, both llm/stream listeners -------------------------
+        {"plugin": llm_retry},
+        {"plugin": token_meter},
+
         # --- policy and observation, none of which the loop knows about --------------------
         {"plugin": permission, "config": {"default": "ask"}},
         {"plugin": timeout, "config": {"seconds": 30.0}},
         {"plugin": telemetry, "config": {"verbose": True}},
+        {"plugin": stream_ui},
 
         # --- the loop, mounted like anything else -----------------------------------------
         {"plugin": agent_loop, "config": {

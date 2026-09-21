@@ -77,11 +77,15 @@ def main(argv: list[str] | None = None) -> int:
                 return 1
 
     print(f"\nyou> {args.prompt}\n")
+    streaming = "stream-ui" in runtime.plugin_names()
     try:
         answer = loop.run(args.prompt)
     finally:
         runtime.dispose()  # unwinds every plugin's registrations, newest first
-    print(f"\nbot> {answer}")
+    # The stream UI already rendered this token by token; printing it again would show the
+    # same answer twice. Whether it did is a property of the mounted profile, not of the CLI.
+    if not streaming:
+        print(f"\nbot> {answer}")
     return 0
 
 

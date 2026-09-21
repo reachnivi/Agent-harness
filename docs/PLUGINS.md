@@ -77,13 +77,46 @@ pins this down.
 
 | Key | Provided by | Owns |
 |---|---|---|
-| `ctx.llm` | `services/llm.py` | the adapter seam + neutral message vocabulary |
+| `ctx.llm` | `services/llm.py` | the adapter seam, neutral vocabulary, `StreamChunk` protocol |
 | `ctx.tools` | `services/tools.py` | tool registry + the pipeline above |
 | `ctx.sessions` | `services/sessions.py` | append-only event log; model history is *derived* |
 | `ctx.agent_loop` | `services/agent_loop.py` | the loop — itself just a plugin |
+| `ctx.tokens` | `plugins/token_meter.py` | usage accounting, via the `llm/stream` waterfall |
 
 dsh has many more (`ctx.agents`, `ctx.jobs`, `ctx.fs`, `ctx.sandbox`, `ctx.commands`,
 `ctx.approval`, …). The four here are enough to show the shape.
+
+## Streaming (phase 6)
+
+`ctx.llm.stream()` returns an iterator of `StreamChunk`, ported near-verbatim from dsh:
+
+```
+block-start / text-delta / reasoning-delta / tool-call-delta / block-end / usage / finish
+```
+
+Three adapter rules, each fixing a real failure:
+
+1. **`index` ties a delta to its block**, allocated in first-seen order and reused. A response
+   interleaves text and several tool calls; without it you cannot tell whose delta you hold.
+2. **Tool arguments stay raw JSON strings**, streamed as `arguments_delta`, parsed once at the
+   end. Parsing a fragment is how you get a JSONDecodeError halfway through a reply.
+3. **`usage` before `finish`, nothing after `finish`.** Consumers treat finish as terminal.
+
+`BlockAssembler` is the one shared fold from chunks back to a `Completion`, so the loop (which
+needs a finished message) and a UI (which wants deltas) read the same stream without either
+reimplementing accumulation. `plugins/stream_ui.py` is the smallest consumer of the raw side.
+
+**Two SSE dialects, one protocol.** OpenAI sends anonymous `data:` frames with fragmentary
+`tool_calls[].function.arguments` and a `[DONE]` sentinel; Anthropic sends *named* events with
+an explicit block lifecycle and the tool name on `content_block_start`. Both normalize to the
+chunks above inside their adapter. `dshpy/sse.py` is the hand-written parser — the two tests
+worth reading are the ones for a frame split across reads and a multi-byte character split
+across reads, both valid input that a naive parser mangles.
+
+**Failure normalization is the outermost layer.** An adapter may raise; `llm/stream` listeners
+see the raw exception (retry needs it to tell a 503 from a 400); only at the very top is it
+turned into a terminal `finish{error|aborted}`. Getting this order wrong — normalizing on the
+inside — silently disables retry, which is exactly what happened on the first attempt.
 
 ## What was deliberately left out
 
@@ -94,11 +127,19 @@ Faithfulness has a cost, and these were judged not worth it for a learning port:
   plugin tree from ordered layers, each patchable by the ones above. That is config plumbing,
   not architectural insight. `profiles/default.py` is the one-layer version.
 - **Context forking / isolate realms** — dsh scopes registrations per agent via `agent.ctx`.
-- **Streaming** — both adapters are request/response. Streaming would change the adapter
-  contract (`AsyncIterable[StreamChunk]`) but not the architecture.
-- **A real cancellation signal.** `plugins/timeout.py` uses a daemon thread, so the *call*
-  returns on time but the work keeps running. dsh threads an `exec.signal` through to the tool
-  body. Honest simplification, flagged in the file.
+- **Async.** dsh's adapters are `AsyncIterable` because Node is async; ours are sync generators.
+  Identical streaming semantics, and it keeps `async def` out of the kernel and every plugin.
+  The one real cost: tool calls in a batch run sequentially, where dsh runs them concurrently.
+- **`replay_state`** — dsh's adapters carry provider-private metadata on `finish` for replaying
+  a response. Ours don't, so history is rebuilt from the neutral vocabulary only.
+
+### Cancellation is cooperative, and that is a real limit
+
+`plugins/timeout.py` sets a deadline on `exec.token`; long-running tool bodies poll it with
+`exec.token.check()`. A tool that never polls **cannot be interrupted** — Python has no safe
+way to stop an arbitrary thread — and there is a test asserting exactly that rather than hiding
+it. This replaced phase 5's daemon thread, which returned on time while the work carried on
+invisibly. Failing visibly beats succeeding falsely.
 
 ## Writing a plugin
 

@@ -248,6 +248,10 @@ class Runtime:
 
     # --- introspection --------------------------------------------------------------------
 
+    def plugin_names(self) -> list[str]:
+        """Names of every mounted plugin, active or waiting."""
+        return [entry.name for entry in self._mounted]
+
     def dump(self) -> str:
         """What `dsh --dump-config` does: show the mounted tree and why each row is where."""
         lines = ["mounted plugins:"]

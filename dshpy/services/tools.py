@@ -39,6 +39,8 @@ import json
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
+from dshpy.cancel import Cancelled, CancelToken
+
 name = "tools"
 inject: list[str] = []
 
@@ -82,12 +84,18 @@ class ToolDefinition:
 
 @dataclass
 class ToolExecution:
-    """One in-flight call. Identity is fixed; policy plugins read it to make decisions."""
+    """One in-flight call. Identity is fixed; policy plugins read it to make decisions.
+
+    `token` is the cooperative cancellation signal (phase 6). A tool body that can run long
+    MUST poll it -- `exec.token.check()` inside its loop -- or it cannot be interrupted and
+    `plugins/timeout.py` can only report a deadline it was unable to enforce.
+    """
 
     call_id: str
     name: str
     arguments: dict
     definition: ToolDefinition | None = None
+    token: CancelToken | None = None
 
 
 @dataclass
@@ -161,11 +169,12 @@ class ToolsService:
 
     # -- the pipeline -----------------------------------------------------------------------
 
-    def execute(self, call_id: str, tool_name: str, arguments: dict) -> ToolResult:
+    def execute(self, call_id: str, tool_name: str, arguments: dict,
+                token: CancelToken | None = None) -> ToolResult:
         """Run one tool call through the full pipeline. The only method the loop calls."""
         definition = self._tools.get(tool_name)
-        exec_ = ToolExecution(call_id=call_id, name=tool_name,
-                              arguments=arguments, definition=definition)
+        exec_ = ToolExecution(call_id=call_id, name=tool_name, arguments=arguments,
+                              definition=definition, token=token)
 
         if definition is None:
             # An unknown tool is a normal event, not a crash: models hallucinate tool names,
@@ -201,6 +210,11 @@ class ToolsService:
                 value = e.definition.execute(e.arguments, e)
                 content = value if isinstance(value, str) else json.dumps(value, default=str)
                 return ToolResult(call_id, tool_name, content)
+            except Cancelled as exc:
+                # Cancellation is not a tool bug -- it is the outcome the caller asked for.
+                # It still comes back as a result so the model learns why nothing happened.
+                return ToolResult(call_id, tool_name, f"Error: {exc.reason}", is_error=True,
+                                  meta={"cancelled": True})
             except Exception as exc:  # noqa: BLE001 - tool failures are results, not crashes
                 return ToolResult(call_id, tool_name, f"Error: {exc}", is_error=True)
 
