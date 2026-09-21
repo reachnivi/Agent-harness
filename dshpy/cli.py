@@ -17,19 +17,24 @@ import sys
 
 from common.ollama import PreflightError, is_local, preflight
 from dshpy.core.context import Runtime
+from dshpy.profiles import coding as coding_profile
 from dshpy.profiles import default as default_profile
 
 
 def build_runtime(provider: str | None = None, *, assume_yes: bool = False,
-                  quiet: bool = False) -> Runtime:
+                  quiet: bool = False, profile: str = "default") -> Runtime:
     if provider:
         default_profile.PROVIDER = provider
 
-    rows = default_profile.rows()
+    rows = (coding_profile if profile == "coding" else default_profile).rows()
     if assume_yes:
         for row in rows:
-            if row["plugin"] is not None and getattr(row["plugin"], "name", "") == "permission":
-                row.setdefault("config", {})["default"] = "allow"
+            if getattr(row["plugin"], "name", "") == "permission":
+                # --yes means "answer yes to every prompt", NOT "rewrite the policy". Setting
+                # default=allow would be the wrong fix: DEFAULT_POLICY marks write_file and
+                # bash as "ask" explicitly, and an explicit entry beats the default -- so
+                # --yes would silently do nothing for exactly the tools it matters for.
+                row.setdefault("config", {})["ask"] = lambda exec_: True
     if quiet:
         for row in rows:
             if getattr(row["plugin"], "name", "") == "telemetry":
@@ -43,6 +48,8 @@ def build_runtime(provider: str | None = None, *, assume_yes: bool = False,
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="dshpy", description=__doc__)
     parser.add_argument("prompt", nargs="?", help="what to ask")
+    parser.add_argument("--profile", choices=["default", "coding"], default="default",
+                        help="coding adds a filesystem, a shell, and the tools for them")
     parser.add_argument("--provider", choices=["openai", "anthropic"],
                         help="which wire protocol to speak (default: $DS_PROVIDER or openai)")
     parser.add_argument("--dump-config", action="store_true",
@@ -52,7 +59,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--skip-preflight", action="store_true")
     args = parser.parse_args(argv)
 
-    runtime = build_runtime(args.provider, assume_yes=args.yes, quiet=args.quiet)
+    runtime = build_runtime(args.provider, assume_yes=args.yes, quiet=args.quiet,
+                            profile=args.profile)
 
     if args.dump_config:
         print(runtime.dump())

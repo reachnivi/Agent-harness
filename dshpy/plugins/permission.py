@@ -33,9 +33,25 @@ from dshpy.services.tools import Deny
 name = "permission"
 inject = ["tools"]
 
+# Read-only tools allow; anything that mutates the world or runs code asks.
+#
+# This is the line where the gate stops being a demo. `bash` can do anything the user can, and
+# `write_file` can destroy work -- so the default answer for both is "ask a human", and a
+# deployment that wants otherwise has to say so explicitly. Defaulting to allow and relying on
+# the model's judgement is a decision, and it should be one somebody made on purpose.
 DEFAULT_POLICY = {
+    # harmless
     "get_time": "allow",
     "calculate": "allow",
+    # read-only: cheap to allow, expensive to interrupt for
+    "read_file": "allow",
+    "list_dir": "allow",
+    "glob": "allow",
+    "grep": "allow",
+    # mutating or arbitrary-code: ask
+    "write_file": "ask",
+    "edit_file": "ask",
+    "bash": "ask",
 }
 
 
@@ -60,25 +76,35 @@ def apply(ctx, config=None) -> None:
     ctx.on("tools/pre-execute", gate)
 
     # --- monotonic invariant --------------------------------------------------------------
-    def confine_paths(exec_):
-        """Any argument that looks like a path must stay inside the project root.
-
-        Schema validation is NOT path validation: a schema saying "string" happily accepts
-        '../../.ssh/authorized_keys'. And this belongs in a guard rather than the gate above
-        precisely because no configuration should be able to switch it off.
-        """
+    #
+    # Path confinement MOVED to plugins/fs_guard.py in phase 7. It belongs next to the
+    # filesystem: it must understand symlinks and roots, and it must protect every fs consumer
+    # rather than only tools whose argument happens to be named `path`. It is still a guard,
+    # not a gate -- nothing mounted later may switch it off.
+    #
+    # A generic argument-shaped fallback is kept here for tools that take a path but do NOT go
+    # through ctx.fs (a future tool nobody has written yet). Defence in depth: the real check
+    # is in fs_guard, this one catches the tool that forgot to use the seam.
+    def confine_stray_paths(exec_):
         for key, value in exec_.arguments.items():
             if not isinstance(value, str) or key not in {"path", "file", "filename", "dir"}:
                 continue
             try:
-                resolved = Path(value).expanduser().resolve()
+                candidate = Path(value).expanduser()
+                # Resolve a relative path against the ROOT, not the process cwd. Getting this
+                # wrong makes the guard reject `read_file("f.txt")` as an escape, because
+                # Path("f.txt").resolve() silently anchors to wherever the process happens to
+                # be running -- which is not where the agent's root is.
+                if not candidate.is_absolute():
+                    candidate = root / candidate
+                resolved = candidate.resolve()
             except (OSError, RuntimeError):
                 return Deny(f"unusable path in {key!r}")
-            if not resolved.is_relative_to(root):
+            if resolved != root and root not in resolved.parents:
                 return Deny(f"path {value!r} is outside the project root")
         return None
 
-    ctx.effect(ctx.tools.guard(confine_paths))
+    ctx.effect(ctx.tools.guard(confine_stray_paths))
 
 
 def _prompt(exec_) -> bool:

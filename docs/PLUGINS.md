@@ -82,6 +82,8 @@ pins this down.
 | `ctx.sessions` | `services/sessions.py` | append-only event log; model history is *derived* |
 | `ctx.agent_loop` | `services/agent_loop.py` | the loop — itself just a plugin |
 | `ctx.tokens` | `plugins/token_meter.py` | usage accounting, via the `llm/stream` waterfall |
+| `ctx.fs` | `services/fs.py` | filesystem seam; `fs_local` is the provider |
+| `ctx.shell` | `services/shell.py` | subprocess seam; `shell_local` is the provider |
 
 dsh has many more (`ctx.agents`, `ctx.jobs`, `ctx.fs`, `ctx.sandbox`, `ctx.commands`,
 `ctx.approval`, …). The four here are enough to show the shape.
@@ -117,6 +119,39 @@ across reads, both valid input that a naive parser mangles.
 see the raw exception (retry needs it to tell a 503 from a 400); only at the very top is it
 turned into a terminal `finish{error|aborted}`. Getting this order wrong — normalizing on the
 inside — silently disables retry, which is exactly what happened on the first attempt.
+
+## The filesystem and shell seams (phase 7)
+
+Same three-role shape as `ctx.llm`: a contract (`services/fs.py`), a provider
+(`plugins/fs_local.py`), and model-facing consumers (`plugins/tool_fs.py`). Pointing the agent
+at a container becomes a config change rather than a fork of the tools.
+
+**The intents are mutable objects, not positional arguments.** `fs/read-intent`,
+`fs/write-intent` and `fs/edit-intent` each carry a dataclass that a listener may mutate before
+calling `next()`. That is dsh's cooperative-listener idiom, and it is load-bearing: `next()`
+takes no arguments, so a guard that needs to impose a version the caller never supplied has no
+other way to do it. The first version of `fs.py` used positional args and needed an awkward
+helper to work around exactly this.
+
+**Path confinement moved out of `permission.py`.** It belongs next to the filesystem — it must
+understand symlinks and roots, and it must cover every `ctx.fs` consumer rather than only tools
+whose argument happens to be named `path`. It is still a *guard*, not a gate.
+
+**Read-before-edit** is the version guard in action: `fs_guard` records the version of every
+file read and imposes it on the next write. A model working from a copy it read three tool
+calls ago will otherwise silently destroy whatever changed in between.
+
+### Two bugs worth keeping in the record
+
+- **Killing the process, not the group.** With `shell=True` the child is `/bin/sh -c ...`, and
+  the shell may *fork* the real command. Terminating the shell leaves a grandchild holding the
+  stdout pipe open, so `communicate()` then blocks until the orphan finishes on its own. The
+  symptom is a timeout that reports success and still takes the full 30 seconds.
+  `start_new_session=True` plus `os.killpg` is the fix.
+- **`resolve()` anchors a relative path to the process cwd**, not to the agent's root. A
+  confinement check that forgets this rejects `read_file("f.txt")` as an escape.
+
+Both are in the tests now, which is the only reason they stay fixed.
 
 ## What was deliberately left out
 
