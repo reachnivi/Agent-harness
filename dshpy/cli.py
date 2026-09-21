@@ -48,6 +48,12 @@ def build_runtime(provider: str | None = None, *, assume_yes: bool = False,
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="dshpy", description=__doc__)
     parser.add_argument("prompt", nargs="?", help="what to ask")
+    parser.add_argument("--resume", metavar="SESSION_ID", help="continue a stored session")
+    parser.add_argument("--fork", metavar="SESSION_ID",
+                        help="branch a stored session at its last completed turn")
+    parser.add_argument("--sessions", action="store_true", help="list stored sessions")
+    parser.add_argument("--compact", action="store_true",
+                        help="summarize earlier history before running")
     parser.add_argument("--profile", choices=["default", "coding"], default="default",
                         help="coding adds a filesystem, a shell, and the tools for them")
     parser.add_argument("--provider", choices=["openai", "anthropic"],
@@ -66,8 +72,23 @@ def main(argv: list[str] | None = None) -> int:
         print(runtime.dump())
         return 0
 
-    if not args.prompt:
-        parser.error("a prompt is required (or use --dump-config)")
+    store = runtime.services.get("persistence")
+    if args.sessions:
+        for session_id in (store.list_sessions() if store else []):
+            print(session_id)
+        return 0
+
+    if args.fork:
+        child = store.fork(args.fork)
+        print(f"forked {args.fork} -> {child}")
+        args.resume = child
+
+    if args.resume:
+        count = store.resume(args.resume)
+        print(f"resumed {args.resume} ({count} events)")
+
+    if not args.prompt and not (args.sessions or args.fork or args.compact):
+        parser.error("a prompt is required (or use --dump-config / --sessions)")
 
     loop = runtime.services.get("agent_loop")
     if loop is None:
@@ -84,8 +105,16 @@ def main(argv: list[str] | None = None) -> int:
                 print(f"\nPreflight failed:\n{exc}\n", file=sys.stderr)
                 return 1
 
+    if args.compact:
+        result = runtime.services["compaction"].compact(reason="manual")
+        print(f"compacted {result.shadowed_events} events" if result else "nothing to compact")
+
     print(f"\nyou> {args.prompt}\n")
     streaming = "stream-ui" in runtime.plugin_names()
+    # Read this BEFORE dispose(): teardown frees every service key, so reaching for
+    # `runtime.services["sessions"]` afterwards is a KeyError. Reversible effects are only a
+    # good property if you remember they actually reverse.
+    session_id = runtime.services["sessions"].session_id
     try:
         answer = loop.run(args.prompt)
     finally:
@@ -94,6 +123,7 @@ def main(argv: list[str] | None = None) -> int:
     # same answer twice. Whether it did is a property of the mounted profile, not of the CLI.
     if not streaming:
         print(f"\nbot> {answer}")
+    print(f"\n[session {session_id} — resume with --resume {session_id}]")
     return 0
 
 

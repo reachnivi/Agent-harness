@@ -23,17 +23,19 @@ import os
 from dotenv import load_dotenv
 
 from dshpy.plugins import (
+    compaction_basic,
     llm_anthropic,
     llm_openai,
     llm_retry,
     permission,
+    persistence_jsonl,
     stream_ui,
     telemetry,
     timeout,
     token_meter,
     tool_core,
 )
-from dshpy.services import agent_loop, llm, sessions, tools
+from dshpy.services import agent_loop, compaction, llm, persistence, sessions, tools
 
 load_dotenv()
 
@@ -44,6 +46,10 @@ PROVIDER = os.environ.get("DS_PROVIDER", "openai")     # "openai" | "anthropic"
 MODEL = os.environ.get("DS_MODEL", "qwen3-coder")
 API_KEY = os.environ.get("DS_API_KEY", "ollama")
 BASE_URL = os.environ.get("DS_BASE_URL", "")           # blank -> per-adapter default
+
+SESSION_ROOT = os.environ.get("DS_SESSION_ROOT", ".dshpy/sessions")
+# Compact when the derived context passes this many (estimated) tokens. 0 disables it.
+COMPACT_AT = int(os.environ.get("DS_COMPACT_AT", "0"))
 
 SYSTEM_PROMPT = (
     "You are a concise assistant with tools. Use a tool when it is the right way to get an "
@@ -86,6 +92,15 @@ def rows() -> list[dict]:
 
         # --- capabilities -----------------------------------------------------------------
         {"plugin": tool_core},
+
+        # --- durability: the log is written as it happens, resume/fork read it back ------
+        {"plugin": persistence},
+        {"plugin": persistence_jsonl, "config": {"root": SESSION_ROOT}},
+
+        # --- context management: a projection change, not a destructive edit --------------
+        {"plugin": compaction},
+        {"plugin": compaction_basic, "config": {
+            "threshold_tokens": COMPACT_AT or None, "keep_last_turns": 2}},
 
         # --- resilience and accounting, both llm/stream listeners -------------------------
         {"plugin": llm_retry},

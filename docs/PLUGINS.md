@@ -84,6 +84,8 @@ pins this down.
 | `ctx.tokens` | `plugins/token_meter.py` | usage accounting, via the `llm/stream` waterfall |
 | `ctx.fs` | `services/fs.py` | filesystem seam; `fs_local` is the provider |
 | `ctx.shell` | `services/shell.py` | subprocess seam; `shell_local` is the provider |
+| `ctx.persistence` | `services/persistence.py` | storing/reloading a log; JSONL backend |
+| `ctx.compaction` | `services/compaction.py` | replacing a span of history with a summary |
 
 dsh has many more (`ctx.agents`, `ctx.jobs`, `ctx.fs`, `ctx.sandbox`, `ctx.commands`,
 `ctx.approval`, …). The four here are enough to show the shape.
@@ -152,6 +154,43 @@ calls ago will otherwise silently destroy whatever changed in between.
   confinement check that forgets this rejects `read_file("f.txt")` as an escape.
 
 Both are in the tests now, which is the only reason they stay fixed.
+
+## Persistence, fork and compaction (phase 8)
+
+This phase is where the phase-3 decision pays off. Because the log is append-only and the model
+view is *derived*, "save" is one appended line, "resume" is reading the lines back, and "fork"
+is copying a prefix. None of them needed the agent loop touched.
+
+**JSONL, not JSON.** A JSON array must be rewritten in full on every append and is unreadable
+until the closing bracket. JSONL stays valid at every instant, so a crash costs at most the
+line being written — and a torn final line is skippable rather than fatal. There is a test that
+tears one.
+
+**Fork only at a turn boundary.** A fork mid-turn leaves an assistant message asking for tools
+whose results never arrive, and *both* wire protocols reject that as malformed. So the cut
+point is a recorded `turn/end`, and an explicit one is validated rather than trusted.
+
+**Compaction changes the projection, not the record.** Following dsh: three log-only events
+(`compaction/start` / `summary` / `end`) bracket the operation, and the summary the model
+actually sees rides on an ordinary `user/message` carrying
+`surface_op={"op":"replace","start_seq":…,"end_seq":…}`. `derive_messages()` skips the shadowed
+range; nothing is deleted. So a compacted session is still forkable at an earlier turn, still
+auditable, still replayable — tested.
+
+**The lock releases last, on purpose.** A crash mid-operation then leaves a `compaction/start`
+with no matching `end`, which is detectable and clearable. Release first and a crash leaves an
+`end` that falsely claims success, and you cannot tell a finished compaction from an abandoned
+one by reading the log.
+
+The system prompt is never shadowed: summarizing away an instruction silently changes the
+agent's behavior for the rest of the session.
+
+### One more bug worth keeping
+
+`persistence_jsonl` first took `Path(session_id).name` to stay inside its directory. That *is*
+safe — but `Path("../../escape").name` is `"escape"`, so a suspicious id was silently rewritten
+and the caller read a different session than it asked for, with nothing reporting it. It now
+refuses. Silent correction of suspicious input turns an attack into an unreproducible bug report.
 
 ## What was deliberately left out
 
